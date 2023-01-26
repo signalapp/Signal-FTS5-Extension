@@ -1,0 +1,33 @@
+#
+# Copyright (C) 2023 Signal Messenger, LLC.
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+
+[package]
+name = "signal-tokenizer"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[profile.release]
+lto = true
+
+[dependencies]
+unicode-segmentation = "1.10.1"
+unicode-normalization = "0.1.22"
+# libc without `std`
+libc = { version = "0.2", "default-features" = false, features = [] }
+
+[dev-dependencies]
+criterion = "0.3"
+
+[features]
+default = []
+extension = []
+
+[[bench]]
+name = "tokenizer"
+harness = false
