@@ -39,7 +39,10 @@ fn signal_fts5_tokenize_internal(
     x_token: TokenFunction,
 ) -> Result<(), c_int> {
     let slice = unsafe { core::slice::from_raw_parts(p_text as *const c_uchar, n_text as usize) };
-    let input = core::str::from_utf8(slice).map_err(|_| SQLITE_MISUSE)?;
+
+    // Map errors to SQLITE_OK because failing here means that the database
+    // wouldn't accessible.
+    let input = core::str::from_utf8(slice).map_err(|_| SQLITE_OK)?;
 
     let mut normalized = String::with_capacity(1024);
 
@@ -91,32 +94,31 @@ mod tests {
         assert_eq!(buf, "diacritics");
     }
 
+    extern "C" fn token_callback(
+        ctx: *mut c_void,
+        flags: c_int,
+        token: *const c_char,
+        token_len: c_int,
+        start: c_int,
+        end: c_int,
+    ) -> c_int {
+        assert_eq!(flags, 0);
+
+        let tokens_ptr = ctx as *mut _ as *mut Vec<(String, c_int, c_int)>;
+        let tokens = unsafe { tokens_ptr.as_mut() }.expect("tokens pointer");
+        let slice =
+            unsafe { core::slice::from_raw_parts(token as *const c_uchar, token_len as usize) };
+        let token = String::from_utf8(slice.to_vec()).expect("Expected utf-8 token");
+
+        tokens.push((token, start, end));
+
+        return SQLITE_OK;
+    }
+
     #[test]
     fn it_emits_segments() {
         let input = "hello world! 知识? 안녕 세상";
         let mut tokens: Vec<(String, c_int, c_int)> = vec![];
-
-        extern "C" fn token_callback(
-            ctx: *mut c_void,
-            flags: c_int,
-            token: *const c_char,
-            token_len: c_int,
-            start: c_int,
-            end: c_int,
-        ) -> c_int {
-            assert_eq!(flags, 0);
-
-            let tokens_ptr = ctx as *mut _ as *mut Vec<(String, c_int, c_int)>;
-            let tokens = unsafe { tokens_ptr.as_mut() }.expect("tokens pointer");
-            let slice =
-                unsafe { core::slice::from_raw_parts(token as *const c_uchar, token_len as usize) };
-            let token = String::from_utf8(slice.to_vec()).expect("Expected utf-8 token");
-
-            tokens.push((token, start, end));
-
-            return SQLITE_OK;
-        }
-
         signal_fts5_tokenize_internal(
             &mut tokens as *mut _ as *mut c_void,
             input.as_bytes().as_ptr() as *const c_char,
@@ -137,5 +139,24 @@ mod tests {
             ]
             .map(|(s, start, end)| (s.to_owned(), start, end))
         );
+    }
+
+    #[test]
+    fn it_ignores_invalid_utf8() {
+        let input = b"\xc3\x28";
+        let mut tokens: Vec<(String, c_int, c_int)> = vec![];
+
+        assert_eq!(
+            signal_fts5_tokenize_internal(
+                &mut tokens as *mut _ as *mut c_void,
+                input.as_ptr() as *const c_char,
+                input.len() as i32,
+                token_callback,
+            )
+            .expect_err("tokenize internal should not fail"),
+            SQLITE_OK
+        );
+
+        assert_eq!(tokens, []);
     }
 }
