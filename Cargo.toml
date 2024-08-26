@@ -22,7 +22,7 @@ unicode-normalization = "0.1.22"
 libc = { version = "0.2", "default-features" = false, features = [] }
 
 [dev-dependencies]
-criterion = "0.3"
+criterion = "0.5"
 
 [features]
 default = []
