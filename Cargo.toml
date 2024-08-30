@@ -10,7 +10,7 @@ edition = "2021"
 license = "AGPL-3.0-only"
 
 [lib]
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [profile.release]
 lto = true
