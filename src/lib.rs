@@ -12,7 +12,7 @@ mod extension;
 pub use crate::common::*;
 use libc::{c_char, c_int, c_uchar, c_void};
 use linkify::{LinkFinder, LinkKind};
-use memchr::{memchr, memchr2_iter, memchr3, memchr_iter, memmem};
+use memchr::{memchr, memchr3, memchr_iter, memmem};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -40,7 +40,7 @@ enum TokenType {
     Synonym,
 }
 
-fn on_token(
+fn on_raw_token(
     p_ctx: *mut c_void,
     x_token: TokenFunction,
     token: &str,
@@ -71,6 +71,27 @@ fn on_token(
     Ok(())
 }
 
+fn on_token(
+    p_ctx: *mut c_void,
+    x_token: TokenFunction,
+    token: &str,
+    normalized: &mut String,
+    start: usize,
+) -> Result<(), c_int> {
+    for (off, segment) in token.unicode_word_indices() {
+        on_raw_token(
+            p_ctx,
+            x_token,
+            segment,
+            TokenType::Normal,
+            normalized,
+            start + off,
+            start + off + segment.len(),
+        )?;
+    }
+    Ok(())
+}
+
 fn signal_fts5_tokenize_internal(
     p_ctx: *mut c_void,
     p_text: *const c_char,
@@ -94,9 +115,12 @@ fn signal_fts5_tokenize_internal(
             Some(LinkKind::Url) => {
                 let url = span.as_str();
 
-                // Skip scheme
+                // Emit scheme
                 let start_off = match memmem::find(url.as_bytes(), b"://") {
-                    Some(off) => off + 3,
+                    Some(off) => {
+                        on_token(p_ctx, x_token, &url[..off], &mut normalized, span.start())?;
+                        off + 3
+                    }
                     None => 0,
                 };
 
@@ -108,101 +132,52 @@ fn signal_fts5_tokenize_internal(
                     None => (url, url.len(), ""),
                 };
 
+                // Emit auth
+                let (host, start) = match memchr(b'@', host.as_bytes()) {
+                    Some(off) => {
+                        on_token(p_ctx, x_token, &host[..off], &mut normalized, start)?;
+                        (&host[off + 1..], start + off + 1)
+                    }
+                    None => (host, start),
+                };
+
+                // Split off port
                 let (host, port_off, port) = match memchr(b':', host.as_bytes()) {
                     Some(port_off) => (&host[..port_off], port_off + 1, &host[port_off + 1..]),
                     None => (host, host.len(), ""),
                 };
 
-                // Emit full host name
-                on_token(
-                    p_ctx,
-                    x_token,
-                    host,
-                    TokenType::Normal,
-                    &mut normalized,
-                    start,
-                    start + host.len(),
-                )?;
+                let mut last_off: usize = 0;
 
                 // Emit host parts: www.youtube.com, youtube.com, com as
                 // synonyms
-                for off in memchr2_iter(b'.', b'@', host.as_bytes()) {
-                    on_token(
+                for off in memchr_iter(b'.', host.as_bytes()) {
+                    on_raw_token(
                         p_ctx,
                         x_token,
-                        &host[(off + 1)..],
-                        TokenType::Synonym,
+                        &host[last_off..],
+                        if last_off == 0 {
+                            TokenType::Normal
+                        } else {
+                            TokenType::Synonym
+                        },
                         &mut normalized,
                         start,
                         start + host.len(),
                     )?;
+
+                    // Note: we intentionally don't emit the tld
+                    last_off = off + 1;
                 }
 
                 // Emit port
-                on_token(
-                    p_ctx,
-                    x_token,
-                    port,
-                    TokenType::Normal,
-                    &mut normalized,
-                    start + port_off,
-                    start + port_off + port.len(),
-                )?;
+                on_token(p_ctx, x_token, port, &mut normalized, start + port_off)?;
 
-                let (path, fragment_off, fragment) = match memchr(b'#', path.as_bytes()) {
-                    Some(off) => (&path[..off], path_off + off + 1, &path[off + 1..]),
-                    None => (path, path.len(), ""),
-                };
-
-                let (path, query_off, query) = match memchr(b'?', path.as_bytes()) {
-                    Some(off) => (&path[..off], path_off + off + 1, &path[off + 1..]),
-                    None => (path, path.len(), ""),
-                };
-
-                let mut last_off: usize = 0;
-                for off in memchr_iter(b'/', path.as_bytes()).chain(std::iter::once(path.len())) {
-                    on_token(
-                        p_ctx,
-                        x_token,
-                        &path[last_off..off],
-                        TokenType::Normal,
-                        &mut normalized,
-                        start + path_off + last_off,
-                        start + path_off + off,
-                    )?;
-                    last_off = off + 1;
-                }
-                on_token(
-                    p_ctx,
-                    x_token,
-                    query,
-                    TokenType::Normal,
-                    &mut normalized,
-                    start + query_off,
-                    start + query_off + query.len(),
-                )?;
-                on_token(
-                    p_ctx,
-                    x_token,
-                    fragment,
-                    TokenType::Normal,
-                    &mut normalized,
-                    start + fragment_off,
-                    start + fragment_off + fragment.len(),
-                )?;
+                // Emit path
+                on_token(p_ctx, x_token, path, &mut normalized, start + path_off)?;
             }
             _ => {
-                for (off, segment) in span.as_str().unicode_word_indices() {
-                    on_token(
-                        p_ctx,
-                        x_token,
-                        segment,
-                        TokenType::Normal,
-                        &mut normalized,
-                        span.start() + off,
-                        span.start() + off + segment.len(),
-                    )?;
-                }
+                on_token(p_ctx, x_token, span.as_str(), &mut normalized, span.start())?;
             }
         }
     }
@@ -313,20 +288,39 @@ mod tests {
     #[test]
     fn it_tokenizes_urls() {
         let test_vectors = vec![
-            (
-                "www.example.com",
-                vec!["www.example.com", "example.com", "com"],
-            ),
-            ("example.com?abc", vec!["example.com", "com", "abc"]),
-            ("example.com#abc", vec!["example.com", "com", "abc"]),
-            (
-                "example.com?abc#def",
-                vec!["example.com", "com", "abc", "def"],
-            ),
+            ("www.example.com", vec!["www.example.com", "example.com"]),
+            ("example.com?abc", vec!["example.com", "abc"]),
+            ("example.com#abc", vec!["example.com", "abc"]),
+            ("example.com/path#abc", vec!["example.com", "path", "abc"]),
+            ("example.com?abc#def", vec!["example.com", "abc", "def"]),
+            ("example.com?abc/def", vec!["example.com", "abc", "def"]),
+            ("example.com/#def", vec!["example.com", "def"]),
             (
                 "example.com:123/abc?def",
-                vec!["example.com", "com", "123", "abc", "def"],
+                vec!["example.com", "123", "abc", "def"],
             ),
+            (
+                "https://www.youtube.com/watch?v=test",
+                vec![
+                    "https",
+                    "www.youtube.com",
+                    "youtube.com",
+                    "watch",
+                    "v",
+                    "test",
+                ],
+            ),
+            (
+                "https://a:b@example.com:1234/",
+                vec!["https", "a:b", "example.com", "1234"],
+            ),
+            ("blog.google", vec!["blog.google"]),
+            // TODO: ignore known second-level domains when tokenizing
+            ("amazon.co.uk ", vec!["amazon.co.uk", "co.uk"]),
+            ("email@a.b.c.com ", vec!["email", "a.b.c.com"]),
+            ("http://example.com/", vec!["http", "example.com"]),
+            ("git+ssh://example.com/", vec!["git", "ssh", "example.com"]),
+            ("youtube.com.", vec!["youtube.com"]),
         ];
 
         for (input, expected_tokens) in test_vectors {
@@ -365,14 +359,16 @@ mod tests {
             tokens,
             [
                 (TokenType::Normal, "see", 0, 3),
+                (TokenType::Normal, "https", 4, 9),
                 (TokenType::Normal, "www.signal.org", 12, 26),
                 (TokenType::Synonym, "signal.org", 12, 26),
-                (TokenType::Synonym, "org", 12, 26),
                 (TokenType::Normal, "443", 27, 30),
                 (TokenType::Normal, "abc", 31, 34),
                 (TokenType::Normal, "def", 35, 38),
-                (TokenType::Normal, "q=1", 39, 42),
-                (TokenType::Normal, "#hello/world", 43, 55),
+                (TokenType::Normal, "q", 39, 40),
+                (TokenType::Normal, "1", 41, 42),
+                (TokenType::Normal, "hello", 44, 49),
+                (TokenType::Normal, "world", 50, 55),
                 (TokenType::Normal, "for", 56, 59),
                 (TokenType::Normal, "details", 60, 67),
             ]
