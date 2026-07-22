@@ -4,9 +4,10 @@
 //
 
 use core::ptr::null_mut;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use libc::{c_char, c_int, c_void};
 use signal_tokenizer::{signal_fts5_tokenize, Fts5Tokenizer, SQLITE_OK};
+use std::hint::black_box;
 
 extern "C" fn noop_callback(
     _ctx: *mut c_void,
