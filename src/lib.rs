@@ -20,13 +20,13 @@ use unicode_segmentation::UnicodeSegmentation;
 pub extern "C" fn signal_fts5_tokenize(
     _tokenizer: *mut Fts5Tokenizer,
     p_ctx: *mut c_void,
-    _flags: c_int,
+    flags: c_int,
     p_text: *const c_char,
     n_text: c_int,
     x_token: TokenFunction,
 ) -> c_int {
     std::panic::catch_unwind(|| {
-        match signal_fts5_tokenize_internal(p_ctx, p_text, n_text, x_token) {
+        match signal_fts5_tokenize_internal(p_ctx, flags, p_text, n_text, x_token) {
             Ok(()) => SQLITE_OK,
             Err(code) => code,
         }
@@ -94,6 +94,7 @@ fn on_token(
 
 fn signal_fts5_tokenize_internal(
     p_ctx: *mut c_void,
+    flags: c_int,
     p_text: *const c_char,
     n_text: c_int,
     x_token: TokenFunction,
@@ -149,25 +150,37 @@ fn signal_fts5_tokenize_internal(
 
                 let mut last_off: usize = 0;
 
-                // Emit host parts: www.youtube.com, youtube.com, com as
-                // synonyms
-                for off in memchr_iter(b'.', host.as_bytes()) {
+                if flags & FTS5_TOKENIZE_QUERY == 0 {
+                    // Emit host parts: www.youtube.com, youtube.com, com as
+                    // synonyms
+                    for off in memchr_iter(b'.', host.as_bytes()) {
+                        on_raw_token(
+                            p_ctx,
+                            x_token,
+                            &host[last_off..],
+                            if last_off == 0 {
+                                TokenType::Normal
+                            } else {
+                                TokenType::Synonym
+                            },
+                            &mut normalized,
+                            start,
+                            start + host.len(),
+                        )?;
+
+                        // Note: we intentionally don't emit the tld
+                        last_off = off + 1;
+                    }
+                } else {
                     on_raw_token(
                         p_ctx,
                         x_token,
-                        &host[last_off..],
-                        if last_off == 0 {
-                            TokenType::Normal
-                        } else {
-                            TokenType::Synonym
-                        },
+                        host,
+                        TokenType::Normal,
                         &mut normalized,
                         start,
                         start + host.len(),
                     )?;
-
-                    // Note: we intentionally don't emit the tld
-                    last_off = off + 1;
                 }
 
                 // Emit port
@@ -246,6 +259,7 @@ mod tests {
         let mut tokens: Vec<(TokenType, String, c_int, c_int)> = vec![];
         signal_fts5_tokenize_internal(
             &mut tokens as *mut _ as *mut c_void,
+            0,
             input.as_bytes().as_ptr() as *const c_char,
             input.len() as i32,
             token_callback,
@@ -274,6 +288,7 @@ mod tests {
         assert_eq!(
             signal_fts5_tokenize_internal(
                 &mut tokens as *mut _ as *mut c_void,
+                0,
                 input.as_ptr() as *const c_char,
                 input.len() as i32,
                 token_callback,
@@ -288,19 +303,54 @@ mod tests {
     #[test]
     fn it_tokenizes_urls() {
         let test_vectors = vec![
-            ("www.example.com", vec!["www.example.com", "example.com"]),
-            ("example.com?abc", vec!["example.com", "abc"]),
-            ("example.com#abc", vec!["example.com", "abc"]),
-            ("example.com/path#abc", vec!["example.com", "path", "abc"]),
-            ("example.com?abc#def", vec!["example.com", "abc", "def"]),
-            ("example.com?abc/def", vec!["example.com", "abc", "def"]),
-            ("example.com/#def", vec!["example.com", "def"]),
+            (
+                "www.example.com",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["www.example.com", "example.com"],
+            ),
+            (
+                "www.example.com",
+                FTS5_TOKENIZE_QUERY,
+                vec!["www.example.com"],
+            ),
+            (
+                "example.com?abc",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["example.com", "abc"],
+            ),
+            (
+                "example.com#abc",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["example.com", "abc"],
+            ),
+            (
+                "example.com/path#abc",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["example.com", "path", "abc"],
+            ),
+            (
+                "example.com?abc#def",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["example.com", "abc", "def"],
+            ),
+            (
+                "example.com?abc/def",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["example.com", "abc", "def"],
+            ),
+            (
+                "example.com/#def",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["example.com", "def"],
+            ),
             (
                 "example.com:123/abc?def",
+                FTS5_TOKENIZE_DOCUMENT,
                 vec!["example.com", "123", "abc", "def"],
             ),
             (
                 "https://www.youtube.com/watch?v=test",
+                FTS5_TOKENIZE_DOCUMENT,
                 vec![
                     "https",
                     "www.youtube.com",
@@ -312,21 +362,39 @@ mod tests {
             ),
             (
                 "https://a:b@example.com:1234/",
+                FTS5_TOKENIZE_DOCUMENT,
                 vec!["https", "a:b", "example.com", "1234"],
             ),
-            ("blog.google", vec!["blog.google"]),
+            ("blog.google", FTS5_TOKENIZE_DOCUMENT, vec!["blog.google"]),
             // TODO: ignore known second-level domains when tokenizing
-            ("amazon.co.uk ", vec!["amazon.co.uk", "co.uk"]),
-            ("email@a.b.c.com ", vec!["email", "a.b.c.com"]),
-            ("http://example.com/", vec!["http", "example.com"]),
-            ("git+ssh://example.com/", vec!["git", "ssh", "example.com"]),
-            ("youtube.com.", vec!["youtube.com"]),
+            (
+                "amazon.co.uk ",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["amazon.co.uk", "co.uk"],
+            ),
+            (
+                "email@a.b.c.com ",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["email", "a.b.c.com"],
+            ),
+            (
+                "http://example.com/",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["http", "example.com"],
+            ),
+            (
+                "git+ssh://example.com/",
+                FTS5_TOKENIZE_DOCUMENT,
+                vec!["git", "ssh", "example.com"],
+            ),
+            ("youtube.com.", FTS5_TOKENIZE_DOCUMENT, vec!["youtube.com"]),
         ];
 
-        for (input, expected_tokens) in test_vectors {
+        for (input, flags, expected_tokens) in test_vectors {
             let mut tokens: Vec<(TokenType, String, c_int, c_int)> = vec![];
             signal_fts5_tokenize_internal(
                 &mut tokens as *mut _ as *mut c_void,
+                flags,
                 input.as_bytes().as_ptr() as *const c_char,
                 input.len() as i32,
                 token_callback,
@@ -349,6 +417,7 @@ mod tests {
         let mut tokens: Vec<(TokenType, String, c_int, c_int)> = vec![];
         signal_fts5_tokenize_internal(
             &mut tokens as *mut _ as *mut c_void,
+            0,
             input.as_bytes().as_ptr() as *const c_char,
             input.len() as i32,
             token_callback,

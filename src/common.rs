@@ -15,6 +15,12 @@ pub const SQLITE_MISUSE: c_int = 21;
 // Possible t_flags value for TokenFunction
 pub const FTS5_TOKEN_COLOCATED: c_int = 1;
 
+// Possible flags for tokenizer function
+pub const FTS5_TOKENIZE_QUERY: c_int = 1;
+pub const FTS5_TOKENIZE_PREFIX: c_int = 2;
+pub const FTS5_TOKENIZE_DOCUMENT: c_int = 4;
+pub const FTS5_TOKENIZE_AUX: c_int = 8;
+
 pub type TokenFunction = extern "C" fn(
     p_ctx: *mut c_void,
     t_flags: c_int,
