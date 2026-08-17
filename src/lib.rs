@@ -46,12 +46,22 @@ fn on_raw_token(
     token: &str,
     token_type: TokenType,
     normalized: &mut String,
+    text_len: usize,
     start: usize,
     end: usize,
 ) -> Result<(), c_int> {
     if token.is_empty() {
         return Ok(());
     }
+
+    // Defense in depth: fts5's auxiliary functions (`snippet()`, `highlight()`)
+    // index into the original text with the offsets reported here, so an offset
+    // past the end of the text would make them read out of bounds. Clamp
+    // instead of erroring out so that a miscomputed offset can only degrade a
+    // snippet, and never fail an insert or a query.
+    debug_assert!(start <= end && end <= text_len);
+    let end = end.min(text_len);
+    let start = start.min(end);
 
     normalize_into(token, normalized);
     let rc = x_token(
@@ -76,6 +86,7 @@ fn on_token(
     x_token: TokenFunction,
     token: &str,
     normalized: &mut String,
+    text_len: usize,
     start: usize,
 ) -> Result<(), c_int> {
     for (off, segment) in token.unicode_word_indices() {
@@ -85,6 +96,7 @@ fn on_token(
             segment,
             TokenType::Normal,
             normalized,
+            text_len,
             start + off,
             start + off + segment.len(),
         )?;
@@ -104,6 +116,7 @@ fn signal_fts5_tokenize_internal(
     // Map errors to SQLITE_OK because failing here means that the database
     // wouldn't accessible.
     let input = core::str::from_utf8(slice).map_err(|_| SQLITE_OK)?;
+    let text_len = input.len();
 
     let mut normalized = String::with_capacity(1024);
 
@@ -119,7 +132,14 @@ fn signal_fts5_tokenize_internal(
                 // Emit scheme
                 let start_off = match memmem::find(url.as_bytes(), b"://") {
                     Some(off) => {
-                        on_token(p_ctx, x_token, &url[..off], &mut normalized, span.start())?;
+                        on_token(
+                            p_ctx,
+                            x_token,
+                            &url[..off],
+                            &mut normalized,
+                            text_len,
+                            span.start(),
+                        )?;
                         off + 3
                     }
                     None => 0,
@@ -133,10 +153,22 @@ fn signal_fts5_tokenize_internal(
                     None => (url, url.len(), ""),
                 };
 
+                // `path_off` is relative to the start of `url`, while `start` is
+                // about to be advanced past the userinfo below, so resolve the
+                // absolute offset of the path before that happens.
+                let path_start = start + path_off;
+
                 // Emit auth
                 let (host, start) = match memchr(b'@', host.as_bytes()) {
                     Some(off) => {
-                        on_token(p_ctx, x_token, &host[..off], &mut normalized, start)?;
+                        on_token(
+                            p_ctx,
+                            x_token,
+                            &host[..off],
+                            &mut normalized,
+                            text_len,
+                            start,
+                        )?;
                         (&host[off + 1..], start + off + 1)
                     }
                     None => (host, start),
@@ -164,6 +196,7 @@ fn signal_fts5_tokenize_internal(
                                 TokenType::Synonym
                             },
                             &mut normalized,
+                            text_len,
                             start,
                             start + host.len(),
                         )?;
@@ -178,19 +211,34 @@ fn signal_fts5_tokenize_internal(
                         host,
                         TokenType::Normal,
                         &mut normalized,
+                        text_len,
                         start,
                         start + host.len(),
                     )?;
                 }
 
                 // Emit port
-                on_token(p_ctx, x_token, port, &mut normalized, start + port_off)?;
+                on_token(
+                    p_ctx,
+                    x_token,
+                    port,
+                    &mut normalized,
+                    text_len,
+                    start + port_off,
+                )?;
 
                 // Emit path
-                on_token(p_ctx, x_token, path, &mut normalized, start + path_off)?;
+                on_token(p_ctx, x_token, path, &mut normalized, text_len, path_start)?;
             }
             _ => {
-                on_token(p_ctx, x_token, span.as_str(), &mut normalized, span.start())?;
+                on_token(
+                    p_ctx,
+                    x_token,
+                    span.as_str(),
+                    &mut normalized,
+                    text_len,
+                    span.start(),
+                )?;
             }
         }
     }
@@ -411,6 +459,19 @@ mod tests {
         }
     }
 
+    fn tokenize(input: &str, flags: c_int) -> Vec<(TokenType, String, c_int, c_int)> {
+        let mut tokens: Vec<(TokenType, String, c_int, c_int)> = vec![];
+        signal_fts5_tokenize_internal(
+            &mut tokens as *mut _ as *mut c_void,
+            flags,
+            input.as_bytes().as_ptr() as *const c_char,
+            input.len() as i32,
+            token_callback,
+        )
+        .expect("tokenize internal should not fail");
+        tokens
+    }
+
     #[test]
     fn it_tokenizes_urls_with_correct_offsets() {
         let input = "See https://www.signal.org:443/abc/def?q=1##hello/world for details";
@@ -443,5 +504,75 @@ mod tests {
             ]
             .map(|(token_type, s, start, end)| (token_type, s.to_owned(), start, end))
         );
+    }
+
+    #[test]
+    fn it_tokenizes_urls_with_userinfo_with_correct_offsets() {
+        let input = "See https://user:pw@www.signal.org:443/abc/def?q=1 for details";
+
+        assert_eq!(
+            tokenize(input, FTS5_TOKENIZE_DOCUMENT),
+            [
+                (TokenType::Normal, "see", 0, 3),
+                (TokenType::Normal, "https", 4, 9),
+                (TokenType::Normal, "user:pw", 12, 19),
+                (TokenType::Normal, "www.signal.org", 20, 34),
+                (TokenType::Synonym, "signal.org", 20, 34),
+                (TokenType::Normal, "443", 35, 38),
+                (TokenType::Normal, "abc", 39, 42),
+                (TokenType::Normal, "def", 43, 46),
+                (TokenType::Normal, "q", 47, 48),
+                (TokenType::Normal, "1", 49, 50),
+                (TokenType::Normal, "for", 51, 54),
+                (TokenType::Normal, "details", 55, 62),
+            ]
+            .map(|(token_type, s, start, end)| (token_type, s.to_owned(), start, end))
+        );
+
+        // Every reported range has to be a valid slice of the input, otherwise
+        // fts5's `snippet()`/`highlight()` read out of bounds.
+        for (_token_type, token, start, end) in tokenize(input, FTS5_TOKENIZE_DOCUMENT) {
+            let (start, end) = (start as usize, end as usize);
+            assert!(end <= input.len(), "{token:?} ends past the input");
+            assert!(start <= end, "{token:?} starts after its end");
+            input.get(start..end).unwrap_or_else(|| {
+                panic!("{token:?} range {start}..{end} is not a valid slice of the input")
+            });
+        }
+    }
+
+    #[test]
+    fn it_never_reports_offsets_past_the_end_of_the_input() {
+        let long_userinfo = format!("t://{}@/common", "a".repeat(2036));
+        let inputs = [
+            long_userinfo.as_str(),
+            "https://user@example.com/common",
+            "http://a:b@host.example.com:8080/path?q=1",
+            "user@example.com/",
+            "user@example.com:8080/path",
+            "hello user:pw@example.com/path#frag world",
+            "☃@example.com/☃",
+            "a@b:1/c",
+        ];
+
+        for input in inputs {
+            for flags in [FTS5_TOKENIZE_DOCUMENT, FTS5_TOKENIZE_QUERY] {
+                for (_token_type, token, start, end) in tokenize(input, flags) {
+                    let (start, end) = (start as usize, end as usize);
+                    assert!(
+                        start <= end && end <= input.len(),
+                        "token {token:?} of {input:?} reported {start}..{end}, \
+                         which is not within 0..{}",
+                        input.len()
+                    );
+                    input.get(start..end).unwrap_or_else(|| {
+                        panic!(
+                            "token {token:?} of {input:?} reported {start}..{end}, \
+                             which is not a valid slice of the input"
+                        )
+                    });
+                }
+            }
+        }
     }
 }
