@@ -13,7 +13,6 @@ pub use crate::common::*;
 use libc::{c_char, c_int, c_uchar, c_void};
 use linkify::{LinkFinder, LinkKind};
 use memchr::{memchr, memchr3, memchr_iter, memmem};
-use std::cmp::min;
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -23,51 +22,15 @@ struct TokenContext {
     normalized: String,
 }
 
-struct Token<'a> {
-    value: &'a str,
-    start: usize,
-}
+fn get_slice_range(src: &str, slice: &str) -> core::range::Range<usize> {
+    let src_start = src.as_ptr().addr();
+    let slice_start = slice.as_ptr().addr();
 
-impl<'a> Token<'a> {
-    fn split_at(&self, offset: usize, del_size: usize) -> (Self, Self) {
-        (
-            Self {
-                value: &self.value[..offset],
-                start: self.start,
-            },
-            Self {
-                value: &self.value[(offset + del_size)..],
-                start: min(self.end(), self.start + offset + del_size),
-            },
-        )
-    }
+    let start = slice_start.wrapping_sub(src_start);
+    let end = start.wrapping_add(slice.len());
 
-    fn as_str(&self) -> &'a str {
-        self.value
-    }
-
-    fn as_bytes(&self) -> &'a [u8] {
-        self.value.as_bytes()
-    }
-
-    fn len(&self) -> usize {
-        self.as_str().len()
-    }
-
-    fn start(&self) -> usize {
-        self.start
-    }
-
-    fn end(&self) -> usize {
-        self.start + self.len()
-    }
-
-    fn empty() -> Self {
-        Self {
-            value: "",
-            start: 0,
-        }
-    }
+    assert!(start <= src.len() && end <= src.len());
+    core::range::Range { start, end }
 }
 
 #[no_mangle]
@@ -96,16 +59,15 @@ enum TokenType {
 
 fn on_raw_token(
     ctx: &mut TokenContext,
-    token: &Token,
+    token: &str,
     token_type: TokenType,
-    start: usize,
-    end: usize,
+    range: &core::range::Range<usize>,
 ) -> Result<(), c_int> {
-    if token.as_str().is_empty() {
+    if token.is_empty() {
         return Ok(());
     }
 
-    normalize_into(token.as_str(), &mut ctx.normalized);
+    normalize_into(token, &mut ctx.normalized);
     let rc = (ctx.x_token)(
         ctx.p_ctx,
         match token_type {
@@ -114,8 +76,8 @@ fn on_raw_token(
         },
         ctx.normalized.as_bytes().as_ptr() as *const c_char,
         ctx.normalized.len() as c_int,
-        start as c_int,
-        end as c_int,
+        range.start as c_int,
+        range.end as c_int,
     );
     if rc != SQLITE_OK {
         return Err(rc);
@@ -123,13 +85,10 @@ fn on_raw_token(
     Ok(())
 }
 
-fn on_token(ctx: &mut TokenContext, token: &Token) -> Result<(), c_int> {
-    for (off, segment) in token.as_str().unicode_word_indices() {
-        let word = Token {
-            value: segment,
-            start: token.start + off,
-        };
-        on_raw_token(ctx, &word, TokenType::Normal, word.start(), word.end())?;
+fn on_token(ctx: &mut TokenContext, src: &str, token: &str) -> Result<(), c_int> {
+    for (_off, segment) in token.unicode_word_indices() {
+        let range = get_slice_range(src, segment);
+        on_raw_token(ctx, segment, TokenType::Normal, &range)?;
     }
     Ok(())
 }
@@ -158,78 +117,71 @@ fn signal_fts5_tokenize_internal(
     finder.kinds(&[LinkKind::Url]);
 
     for span in finder.spans(input) {
-        let token = Token {
-            value: span.as_str(),
-            start: span.start(),
-        };
-
+        let token = span.as_str();
         match span.kind() {
             Some(LinkKind::Url) => {
                 // Emit scheme
                 let url = match memmem::find(token.as_bytes(), b"://") {
                     Some(off) => {
-                        let (scheme, after_scheme) = token.split_at(off, 3);
-                        on_token(&mut ctx, &scheme)?;
-                        after_scheme
+                        on_token(&mut ctx, input, &token[..off])?;
+                        &token[off + 3..]
                     }
                     None => token,
                 };
 
                 let (host, path) = match memchr3(b'/', b'?', b'#', url.as_bytes()) {
-                    Some(off) => url.split_at(off, 1),
-                    None => (url, Token::empty()),
+                    Some(off) => (&url[..off], &url[off + 1..]),
+                    None => (url, &url[url.len()..]),
                 };
 
                 // Emit auth
                 let host = match memchr(b'@', host.as_bytes()) {
                     Some(off) => {
-                        let (auth, host) = host.split_at(off, 1);
-                        on_token(&mut ctx, &auth)?;
-                        host
+                        on_token(&mut ctx, input, &host[..off])?;
+                        &host[off + 1..]
                     }
                     None => host,
                 };
 
                 // Split off port
                 let (host, port) = match memchr(b':', host.as_bytes()) {
-                    Some(off) => host.split_at(off, 1),
-                    None => (host, Token::empty()),
+                    Some(off) => (&host[..off], &host[off + 1..]),
+                    None => (host, &host[host.len()..]),
                 };
 
                 let mut last_off: usize = 0;
 
+                let host_range = get_slice_range(input, host);
                 if flags & FTS5_TOKENIZE_QUERY == 0 {
                     // Emit host parts: www.youtube.com, youtube.com, com as
                     // synonyms
                     for off in memchr_iter(b'.', host.as_bytes()) {
                         on_raw_token(
                             &mut ctx,
-                            &host.split_at(last_off, 0).1,
+                            &host[last_off..],
                             if last_off == 0 {
                                 TokenType::Normal
                             } else {
                                 TokenType::Synonym
                             },
-                            // Use original 'host' offsets
-                            host.start(),
-                            host.end(),
+                            &host_range,
                         )?;
 
                         // Note: we intentionally don't emit the tld
                         last_off = off + 1;
                     }
                 } else {
-                    on_raw_token(&mut ctx, &host, TokenType::Normal, host.start(), host.end())?;
+                    on_raw_token(&mut ctx, host, TokenType::Normal, &host_range)?;
                 }
 
                 // Emit port
-                on_token(&mut ctx, &port)?;
+                on_token(&mut ctx, input, port)?;
 
                 // Emit path
-                on_token(&mut ctx, &path)?;
+                on_token(&mut ctx, input, path)?;
             }
             _ => {
-                on_token(&mut ctx, &token)?;
+                on_token(&mut ctx, input, token)?;
             }
         }
     }
