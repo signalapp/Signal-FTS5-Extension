@@ -29,7 +29,7 @@ fn get_slice_range(src: &str, slice: &str) -> core::range::Range<usize> {
     let start = slice_start.wrapping_sub(src_start);
     let end = start.wrapping_add(slice.len());
 
-    assert!(start <= src.len() && end <= src.len());
+    assert!(start <= end && start <= src.len() && end <= src.len());
     core::range::Range { start, end }
 }
 
