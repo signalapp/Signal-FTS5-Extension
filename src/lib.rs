@@ -13,8 +13,62 @@ pub use crate::common::*;
 use libc::{c_char, c_int, c_uchar, c_void};
 use linkify::{LinkFinder, LinkKind};
 use memchr::{memchr, memchr3, memchr_iter, memmem};
+use std::cmp::min;
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
+
+struct TokenContext {
+    p_ctx: *mut c_void,
+    x_token: TokenFunction,
+    normalized: String,
+}
+
+struct Token<'a> {
+    value: &'a str,
+    start: usize,
+}
+
+impl<'a> Token<'a> {
+    fn split_at(&self, offset: usize, del_size: usize) -> (Self, Self) {
+        (
+            Self {
+                value: &self.value[..offset],
+                start: self.start,
+            },
+            Self {
+                value: &self.value[(offset + del_size)..],
+                start: min(self.end(), self.start + offset + del_size),
+            },
+        )
+    }
+
+    fn as_str(&self) -> &'a str {
+        self.value
+    }
+
+    fn as_bytes(&self) -> &'a [u8] {
+        self.value.as_bytes()
+    }
+
+    fn len(&self) -> usize {
+        self.as_str().len()
+    }
+
+    fn start(&self) -> usize {
+        self.start
+    }
+
+    fn end(&self) -> usize {
+        self.start + self.len()
+    }
+
+    fn empty() -> Self {
+        Self {
+            value: "",
+            start: 0,
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn signal_fts5_tokenize(
@@ -41,37 +95,25 @@ enum TokenType {
 }
 
 fn on_raw_token(
-    p_ctx: *mut c_void,
-    x_token: TokenFunction,
-    token: &str,
+    ctx: &mut TokenContext,
+    token: &Token,
     token_type: TokenType,
-    normalized: &mut String,
-    text_len: usize,
     start: usize,
     end: usize,
 ) -> Result<(), c_int> {
-    if token.is_empty() {
+    if token.as_str().is_empty() {
         return Ok(());
     }
 
-    // Defense in depth: fts5's auxiliary functions (`snippet()`, `highlight()`)
-    // index into the original text with the offsets reported here, so an offset
-    // past the end of the text would make them read out of bounds. Clamp
-    // instead of erroring out so that a miscomputed offset can only degrade a
-    // snippet, and never fail an insert or a query.
-    debug_assert!(start <= end && end <= text_len);
-    let end = end.min(text_len);
-    let start = start.min(end);
-
-    normalize_into(token, normalized);
-    let rc = x_token(
-        p_ctx,
+    normalize_into(token.as_str(), &mut ctx.normalized);
+    let rc = (ctx.x_token)(
+        ctx.p_ctx,
         match token_type {
             TokenType::Normal => 0,
             TokenType::Synonym => FTS5_TOKEN_COLOCATED,
         },
-        normalized.as_bytes().as_ptr() as *const c_char,
-        normalized.len() as c_int,
+        ctx.normalized.as_bytes().as_ptr() as *const c_char,
+        ctx.normalized.len() as c_int,
         start as c_int,
         end as c_int,
     );
@@ -81,25 +123,13 @@ fn on_raw_token(
     Ok(())
 }
 
-fn on_token(
-    p_ctx: *mut c_void,
-    x_token: TokenFunction,
-    token: &str,
-    normalized: &mut String,
-    text_len: usize,
-    start: usize,
-) -> Result<(), c_int> {
-    for (off, segment) in token.unicode_word_indices() {
-        on_raw_token(
-            p_ctx,
-            x_token,
-            segment,
-            TokenType::Normal,
-            normalized,
-            text_len,
-            start + off,
-            start + off + segment.len(),
-        )?;
+fn on_token(ctx: &mut TokenContext, token: &Token) -> Result<(), c_int> {
+    for (off, segment) in token.as_str().unicode_word_indices() {
+        let word = Token {
+            value: segment,
+            start: token.start + off,
+        };
+        on_raw_token(ctx, &word, TokenType::Normal, word.start(), word.end())?;
     }
     Ok(())
 }
@@ -116,68 +146,54 @@ fn signal_fts5_tokenize_internal(
     // Map errors to SQLITE_OK because failing here means that the database
     // wouldn't accessible.
     let input = core::str::from_utf8(slice).map_err(|_| SQLITE_OK)?;
-    let text_len = input.len();
 
-    let mut normalized = String::with_capacity(1024);
+    let mut ctx = TokenContext {
+        p_ctx,
+        x_token,
+        normalized: String::with_capacity(1024),
+    };
 
     let mut finder = LinkFinder::new();
     finder.url_must_have_scheme(false);
     finder.kinds(&[LinkKind::Url]);
 
     for span in finder.spans(input) {
+        let token = Token {
+            value: span.as_str(),
+            start: span.start(),
+        };
+
         match span.kind() {
             Some(LinkKind::Url) => {
-                let url = span.as_str();
-
                 // Emit scheme
-                let start_off = match memmem::find(url.as_bytes(), b"://") {
+                let url = match memmem::find(token.as_bytes(), b"://") {
                     Some(off) => {
-                        on_token(
-                            p_ctx,
-                            x_token,
-                            &url[..off],
-                            &mut normalized,
-                            text_len,
-                            span.start(),
-                        )?;
-                        off + 3
+                        let (scheme, after_scheme) = token.split_at(off, 3);
+                        on_token(&mut ctx, &scheme)?;
+                        after_scheme
                     }
-                    None => 0,
+                    None => token,
                 };
 
-                let start = span.start() + start_off;
-                let url = &url[start_off..];
-
-                let (host, path_off, path) = match memchr3(b'/', b'?', b'#', url.as_bytes()) {
-                    Some(off) => (&url[..off], off + 1, &url[off + 1..]),
-                    None => (url, url.len(), ""),
+                let (host, path) = match memchr3(b'/', b'?', b'#', url.as_bytes()) {
+                    Some(off) => url.split_at(off, 1),
+                    None => (url, Token::empty()),
                 };
-
-                // `path_off` is relative to the start of `url`, while `start` is
-                // about to be advanced past the userinfo below, so resolve the
-                // absolute offset of the path before that happens.
-                let path_start = start + path_off;
 
                 // Emit auth
-                let (host, start) = match memchr(b'@', host.as_bytes()) {
+                let host = match memchr(b'@', host.as_bytes()) {
                     Some(off) => {
-                        on_token(
-                            p_ctx,
-                            x_token,
-                            &host[..off],
-                            &mut normalized,
-                            text_len,
-                            start,
-                        )?;
-                        (&host[off + 1..], start + off + 1)
+                        let (auth, host) = host.split_at(off, 1);
+                        on_token(&mut ctx, &auth)?;
+                        host
                     }
-                    None => (host, start),
+                    None => host,
                 };
 
                 // Split off port
-                let (host, port_off, port) = match memchr(b':', host.as_bytes()) {
-                    Some(port_off) => (&host[..port_off], port_off + 1, &host[port_off + 1..]),
-                    None => (host, host.len(), ""),
+                let (host, port) = match memchr(b':', host.as_bytes()) {
+                    Some(off) => host.split_at(off, 1),
+                    None => (host, Token::empty()),
                 };
 
                 let mut last_off: usize = 0;
@@ -187,58 +203,33 @@ fn signal_fts5_tokenize_internal(
                     // synonyms
                     for off in memchr_iter(b'.', host.as_bytes()) {
                         on_raw_token(
-                            p_ctx,
-                            x_token,
-                            &host[last_off..],
+                            &mut ctx,
+                            &host.split_at(last_off, 0).1,
                             if last_off == 0 {
                                 TokenType::Normal
                             } else {
                                 TokenType::Synonym
                             },
-                            &mut normalized,
-                            text_len,
-                            start,
-                            start + host.len(),
+                            // Use original 'host' offsets
+                            host.start(),
+                            host.end(),
                         )?;
 
                         // Note: we intentionally don't emit the tld
                         last_off = off + 1;
                     }
                 } else {
-                    on_raw_token(
-                        p_ctx,
-                        x_token,
-                        host,
-                        TokenType::Normal,
-                        &mut normalized,
-                        text_len,
-                        start,
-                        start + host.len(),
-                    )?;
+                    on_raw_token(&mut ctx, &host, TokenType::Normal, host.start(), host.end())?;
                 }
 
                 // Emit port
-                on_token(
-                    p_ctx,
-                    x_token,
-                    port,
-                    &mut normalized,
-                    text_len,
-                    start + port_off,
-                )?;
+                on_token(&mut ctx, &port)?;
 
                 // Emit path
-                on_token(p_ctx, x_token, path, &mut normalized, text_len, path_start)?;
+                on_token(&mut ctx, &path)?;
             }
             _ => {
-                on_token(
-                    p_ctx,
-                    x_token,
-                    span.as_str(),
-                    &mut normalized,
-                    text_len,
-                    span.start(),
-                )?;
+                on_token(&mut ctx, &token)?;
             }
         }
     }
