@@ -23,6 +23,7 @@ struct TokenContext<'a> {
     tmp_buffer: String,
 }
 
+// Based on https://doc.rust-lang.org/src/core/slice/mod.rs.html#5316
 fn get_slice_range(src: &str, slice: &str) -> core::range::Range<usize> {
     let src_start = src.as_ptr().addr();
     let slice_start = slice.as_ptr().addr();
