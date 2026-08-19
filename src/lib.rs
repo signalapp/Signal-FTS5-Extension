@@ -16,9 +16,10 @@ use memchr::{memchr, memchr3, memchr_iter, memmem};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
-struct TokenContext {
+struct TokenContext<'a> {
     p_ctx: *mut c_void,
     x_token: TokenFunction,
+    source: &'a str,
     normalized: String,
 }
 
@@ -57,8 +58,8 @@ enum TokenType {
     Synonym,
 }
 
-fn on_raw_token(
-    ctx: &mut TokenContext,
+fn on_raw_token<'a>(
+    ctx: &mut TokenContext<'a>,
     token: &str,
     token_type: TokenType,
     range: &core::range::Range<usize>,
@@ -85,9 +86,9 @@ fn on_raw_token(
     Ok(())
 }
 
-fn on_token(ctx: &mut TokenContext, src: &str, token: &str) -> Result<(), c_int> {
+fn on_token<'a>(ctx: &mut TokenContext<'a>, token: &str) -> Result<(), c_int> {
     for (_off, segment) in token.unicode_word_indices() {
-        let range = get_slice_range(src, segment);
+        let range = get_slice_range(ctx.source, segment);
         on_raw_token(ctx, segment, TokenType::Normal, &range)?;
     }
     Ok(())
@@ -109,6 +110,7 @@ fn signal_fts5_tokenize_internal(
     let mut ctx = TokenContext {
         p_ctx,
         x_token,
+        source: input,
         normalized: String::with_capacity(1024),
     };
 
@@ -123,7 +125,7 @@ fn signal_fts5_tokenize_internal(
                 // Emit scheme
                 let url = match memmem::find(token.as_bytes(), b"://") {
                     Some(off) => {
-                        on_token(&mut ctx, input, &token[..off])?;
+                        on_token(&mut ctx, &token[..off])?;
                         &token[off + 3..]
                     }
                     None => token,
@@ -137,7 +139,7 @@ fn signal_fts5_tokenize_internal(
                 // Emit auth
                 let host = match memchr(b'@', host.as_bytes()) {
                     Some(off) => {
-                        on_token(&mut ctx, input, &host[..off])?;
+                        on_token(&mut ctx, &host[..off])?;
                         &host[off + 1..]
                     }
                     None => host,
@@ -175,13 +177,13 @@ fn signal_fts5_tokenize_internal(
                 }
 
                 // Emit port
-                on_token(&mut ctx, input, port)?;
+                on_token(&mut ctx, port)?;
 
                 // Emit path
-                on_token(&mut ctx, input, path)?;
+                on_token(&mut ctx, path)?;
             }
             _ => {
-                on_token(&mut ctx, input, token)?;
+                on_token(&mut ctx, token)?;
             }
         }
     }
