@@ -153,8 +153,9 @@ fn signal_fts5_tokenize_internal(
 
                 let mut last_off: usize = 0;
 
-                let host_range = get_slice_range(input, host);
                 if flags & FTS5_TOKENIZE_QUERY == 0 {
+                    let host_range = get_slice_range(input, host);
+
                     // Emit host parts: www.youtube.com, youtube.com, com as
                     // synonyms
                     for off in memchr_iter(b'.', host.as_bytes()) {
@@ -173,7 +174,7 @@ fn signal_fts5_tokenize_internal(
                         last_off = off + 1;
                     }
                 } else {
-                    on_raw_token(&mut ctx, host, TokenType::Normal, &host_range)?;
+                    on_token(&mut ctx, host)?;
                 }
 
                 // Emit port
