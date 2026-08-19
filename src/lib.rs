@@ -20,7 +20,7 @@ struct TokenContext<'a> {
     p_ctx: *mut c_void,
     x_token: TokenFunction,
     source: &'a str,
-    normalized: String,
+    tmp_buffer: String,
 }
 
 fn get_slice_range(src: &str, slice: &str) -> core::range::Range<usize> {
@@ -68,15 +68,15 @@ fn on_raw_token<'a>(
         return Ok(());
     }
 
-    normalize_into(token, &mut ctx.normalized);
+    normalize_into(token, &mut ctx.tmp_buffer);
     let rc = (ctx.x_token)(
         ctx.p_ctx,
         match token_type {
             TokenType::Normal => 0,
             TokenType::Synonym => FTS5_TOKEN_COLOCATED,
         },
-        ctx.normalized.as_bytes().as_ptr() as *const c_char,
-        ctx.normalized.len() as c_int,
+        ctx.tmp_buffer.as_bytes().as_ptr() as *const c_char,
+        ctx.tmp_buffer.len() as c_int,
         range.start as c_int,
         range.end as c_int,
     );
@@ -111,7 +111,7 @@ fn signal_fts5_tokenize_internal(
         p_ctx,
         x_token,
         source: input,
-        normalized: String::with_capacity(1024),
+        tmp_buffer: String::with_capacity(1024),
     };
 
     let mut finder = LinkFinder::new();
