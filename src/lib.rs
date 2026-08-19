@@ -58,8 +58,8 @@ enum TokenType {
     Synonym,
 }
 
-fn on_raw_token<'a>(
-    ctx: &mut TokenContext<'a>,
+fn on_raw_token(
+    ctx: &mut TokenContext<'_>,
     token: &str,
     token_type: TokenType,
     range: &core::range::Range<usize>,
@@ -86,7 +86,7 @@ fn on_raw_token<'a>(
     Ok(())
 }
 
-fn on_token<'a>(ctx: &mut TokenContext<'a>, token: &str) -> Result<(), c_int> {
+fn on_token(ctx: &mut TokenContext<'_>, token: &str) -> Result<(), c_int> {
     for (_off, segment) in token.unicode_word_indices() {
         let range = get_slice_range(ctx.source, segment);
         on_raw_token(ctx, segment, TokenType::Normal, &range)?;
