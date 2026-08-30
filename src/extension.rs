@@ -298,7 +298,7 @@ pub struct Sqlite3APIRoutines {
 }
 
 #[no_mangle]
-pub extern "C" fn signal_fts5_tokenizer_init(
+pub extern "C" fn sqlite3_signaltokenizer_init(
     db: *mut Sqlite3,
     _pz_err_msg: *mut *mut c_uchar,
     p_api: *const c_void,
